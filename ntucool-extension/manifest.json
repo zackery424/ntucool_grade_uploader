@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "NTU COOL 成績與附件小幫手",
+  "version": "1.0.0",
+  "description": "在 NTU COOL (Canvas) SpeedGrader 頁面，依 Excel 成績表與資料夾中已批改的 PDF，自動比對學號、填入成績並上傳附件。僅在本機執行，不會把資料傳到任何第三方伺服器。",
+  "permissions": ["storage"],
+  "host_permissions": ["https://cool.ntu.edu.tw/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://cool.ntu.edu.tw/courses/*/gradebook/speed_grader*"],
+      "js": ["lib/xlsx.full.min.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

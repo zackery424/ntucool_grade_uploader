@@ -8,6 +8,12 @@
   "content_scripts": [
     {
       "matches": ["https://cool.ntu.edu.tw/courses/*/gradebook/speed_grader*"],
+      "js": ["net_spy.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://cool.ntu.edu.tw/courses/*/gradebook/speed_grader*"],
       "js": ["lib/xlsx.full.min.js", "content.js"],
       "run_at": "document_idle"
     }

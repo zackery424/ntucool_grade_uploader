@@ -19,7 +19,17 @@
     log: [],               // { time, id, name, action, ok, detail }
     autoAdvance: false,
     commentText: '',
+    roster: {},             // { canvasOptionValue: 'B12345678' } 學號快取，避免切學生瞬間畫面還沒補上學號時抓空
+    netEvents: [],          // 由 net_spy.js（注入到頁面主世界）回報的送出評論/附件相關網路請求結果
   };
+
+  // net_spy.js 是用 manifest.json 的 "world": "MAIN" 注入到頁面本身的 JS 環境，
+  // 才攔截得到 NTU COOL 自己程式碼發出的網路請求；這裡用 CustomEvent 接收結果
+  // （content script 跟頁面主世界之間没辦法直接共用變數，只能透過 DOM 事件溝通）。
+  window.addEventListener('__ntucoolHelperNetEvent', (e) => {
+    state.netEvents.push(e.detail);
+    if (state.netEvents.length > 100) state.netEvents.shift();
+  });
 
   // ---------------- 小工具 ----------------
   function wait(ms) { return new Promise((r) => setTimeout(r, ms)); }
@@ -52,13 +62,43 @@
   // ---------------- SpeedGrader DOM ----------------
   function getStudentSelect() { return document.getElementById('students_selectmenu'); }
 
+  // NTU COOL 在切換學生（尤其是剛送出評論、畫面正在更新評分狀態）時，
+  // 下拉選單裡「目前選到的那一項」文字有時會有短暫一瞬間還沒補上學號
+  // （名字先出現，學號跟狀態是之後才補上去的），直接讀取容易撲空。
+  // 這裡改成：先把整個名單掃過一輪、把「當下讀得到學號」的項目都快取起來，
+  // 之後即使某一瞬間讀到的文字缺學號，也能用快取補回來，且快取只會越補越完整、不會被覆蓋成空的。
+  function scanRoster() {
+    const sel = getStudentSelect();
+    if (!sel) return;
+    for (const opt of sel.options) {
+      if (state.roster[opt.value]) continue;
+      const id = extractStudentId(opt.textContent || '');
+      if (id) state.roster[opt.value] = id;
+    }
+  }
+
   function getCurrentStudent() {
     const sel = getStudentSelect();
     if (!sel || sel.selectedIndex < 0) return null;
     const opt = sel.options[sel.selectedIndex];
     if (!opt) return null;
+    scanRoster();
     const raw = (opt.textContent || '').trim();
-    return { raw, id: extractStudentId(raw), optionValue: opt.value };
+    const id = extractStudentId(raw) || state.roster[opt.value] || null;
+    if (id) state.roster[opt.value] = id;
+    return { raw, id, optionValue: opt.value };
+  }
+
+  // 保險用：萬一連快取都還沒有（例如真的是第一次看到這位學生、掃描名單當下剛好也撲空），
+  // 就短暫輪詢重試幾次，而不是立刻判定「找不到學號」。
+  async function waitForStudentId(timeoutMs) {
+    const deadline = Date.now() + (timeoutMs || 2000);
+    let cur = getCurrentStudent();
+    while ((!cur || !cur.id) && Date.now() < deadline) {
+      await wait(150);
+      cur = getCurrentStudent();
+    }
+    return cur;
   }
 
   function getGradeInput() { return document.getElementById('grading-box-extended'); }
@@ -76,23 +116,76 @@
     return true;
   }
 
+  // 只找「畫面上看得到」的 file input：document.querySelectorAll 理論上不會照到
+  // 我們自己面板（shadow DOM）裡的欄位，但 NTU COOL 頁面本身可能還留著看不見的
+  // 樣板／備用欄位，如果誤選到那種隱藏欄位，我們自己讀起來會覺得「設定成功」，
+  // 畫面上卻完全沒反應，送出時當然也不會帶到真正的附件——這很可能就是目前遇到的狀況。
+  function visibleFileInputs() {
+    return Array.from(document.querySelectorAll('input[type=file]')).filter((el) => {
+      if (!(el.offsetParent || el.getClientRects().length)) return false;
+      const style = window.getComputedStyle(el);
+      return style.display !== 'none' && style.visibility !== 'hidden';
+    });
+  }
+
+  // 清掉之前失敗/重試留下的空附件欄位，避免每次重試都再疊加一排新的，
+  // 畫面越來越亂，也讓「新增了幾個 input」的判斷更準。
+  // 針對每個「畫面上看得到、還是空的」欄位，往上找它自己附近的「刪除附件」連結來點掉
+  // （用就近搜尋、而不是整頁配對，避免不小心點掉別的、已經選好檔案的欄位）。
+  function cleanupEmptyAttachmentRows() {
+    const inputs = visibleFileInputs();
+    inputs.forEach((inp) => {
+      const isEmpty = !inp.files || inp.files.length === 0;
+      if (!isEmpty) return;
+      let scope = inp.parentElement;
+      let delLink = null;
+      for (let hops = 0; hops < 5 && scope && !delLink; hops++) {
+        delLink = Array.from(scope.querySelectorAll('a')).find((a) => (a.textContent || '').includes('刪除附件'));
+        scope = scope.parentElement;
+      }
+      if (delLink) delLink.click();
+    });
+  }
+
   async function attachFile(file) {
+    cleanupEmptyAttachmentRows();
     const addBtn = document.getElementById('add_attachment');
     if (!addBtn) throw new Error('找不到「文檔附件」按鈕，請確認目前在作業評論區塊');
-    const before = document.querySelectorAll('input[type=file]').length;
+    const before = visibleFileInputs().length;
     addBtn.click();
     let input = null;
     for (let i = 0; i < 30; i++) {
-      const inputs = document.querySelectorAll('input[type=file]');
+      const inputs = visibleFileInputs();
       if (inputs.length > before) { input = inputs[inputs.length - 1]; break; }
       await wait(100);
     }
     if (!input) throw new Error('點擊附加檔案後找不到新的上傳欄位（頁面結構可能已變更）');
+
     const dt = new DataTransfer();
     dt.items.add(file);
     input.files = dt.files;
+    fireEvent(input, 'input');
     fireEvent(input, 'change');
-    return true;
+
+    // 驗證瀏覽器有沒有真的把檔案設定上去——但只檢查「files 有沒有拿到正確的檔案」跟
+    // 「這個 input 還在不在 DOM 裡」，不要求它之後還維持「看得見」：
+    // 實測發現 NTU COOL 選好檔案後，會把這個欄位換成別的顯示方式（不再是原本的檔案選擇器樣式），
+    // 同時自動多加一排新的空白欄位讓你可以繼續加下一個附件，這是正常行為、不是失敗。
+    await wait(150);
+    const gotFile = !!(input.files && input.files.length > 0 && input.files[0] && input.files[0].name === file.name);
+    const stillInDom = document.body.contains(input);
+    if (!gotFile || !stillInDom) {
+      throw new Error(
+        `附加檔案後驗證失敗（瀏覽器回報 files.length=${input.files ? input.files.length : '無法讀取'}，` +
+        `欄位${stillInDom ? '仍在' : '已經從'} DOM 上${stillInDom ? '' : '消失'}）——瀏覽器可能沒有真的把檔案設定進這個欄位`
+      );
+    }
+
+    // 選好檔案後 NTU COOL 常會自動多加一排空白的附件欄位（方便再加下一個檔案），
+    // 這排我們用不到，先清掉，避免送出時因為存在一個完全空白的附件欄位而出問題。
+    cleanupEmptyAttachmentRows();
+
+    return input; // 回傳這個 input 元素本身，submitComment 會用它來判斷「附件列是否已隨送出而清空」
   }
 
   function setCommentText(text) {
@@ -115,17 +208,62 @@
 
   function getSubmitButton() { return document.getElementById('comment_submit_button'); }
 
-  async function submitComment() {
+  // 等待 net_spy.js 回報「這次點提交之後、跟 submissions 有關」的網路請求結果。
+  async function waitForSubmissionNetResult(sinceTime, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const hit = state.netEvents.find((ev) => ev.at >= sinceTime);
+      if (hit) return hit;
+      await wait(150);
+    }
+    return null;
+  }
+
+  function summarizeNetError(netResult) {
+    let msg = `伺服器回應 HTTP ${netResult.status}`;
+    if (netResult.body) {
+      let shortBody = netResult.body;
+      try {
+        const parsed = JSON.parse(netResult.body);
+        shortBody = (parsed && (parsed.message || parsed.error || (parsed.errors && JSON.stringify(parsed.errors)))) || netResult.body;
+      } catch (e) { /* 不是 JSON，原樣使用 */ }
+      msg += '：' + String(shortBody).slice(0, 300);
+    }
+    return msg;
+  }
+
+  // fileInputRef：attachFile() 回傳的 input 元素（若這次有附加檔案）。
+  // 判斷「送出成功」優先順序：
+  //   ① net_spy.js 回報的真實 HTTP 狀態碼（最準確，能分辨出真的失敗還是只是比較慢）
+  //   ② 退而求其次：留言區留言數量增加，或附件欄位已從畫面消失（NTU COOL 送出成功後會清空）
+  //   ③ 畫面跳出 Canvas 錯誤提示（ic-flash-error）時，直接回報錯誤內容
+  async function submitComment(fileInputRef) {
+    cleanupEmptyAttachmentRows(); // 送出前再清一次，避免有殘留的空白附件欄位干擾送出
     const btn = getSubmitButton();
     if (!btn) throw new Error('找不到評論區的「提交」按鈕');
     const before = document.querySelectorAll('#comments .comment').length;
+    const clickTime = Date.now();
     btn.click();
-    for (let i = 0; i < 50; i++) {
-      const now = document.querySelectorAll('#comments .comment').length;
-      if (now > before) return true;
-      await wait(200);
+
+    const netResult = await waitForSubmissionNetResult(clickTime, 15000);
+    if (netResult) {
+      if (netResult.ok) return { ok: true };
+      return { ok: false, error: summarizeNetError(netResult) };
     }
-    return false; // 逾時：不確定是否成功，需自行確認畫面
+
+    // 沒抓到網路事件（例如頁面 CSP 擋掉了監看用的腳本），退回用畫面變化判斷
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      const now = document.querySelectorAll('#comments .comment').length;
+      if (now > before) return { ok: true };
+      if (fileInputRef && !document.body.contains(fileInputRef)) return { ok: true };
+      const errEl = document.querySelector('.ic-flash-error, #flash_message_holder .ic-flash-error');
+      if (errEl && errEl.textContent && errEl.textContent.trim()) {
+        return { ok: false, error: '頁面顯示錯誤：' + errEl.textContent.trim() };
+      }
+      await wait(250);
+    }
+    return { ok: false, error: '逾時，不確定是否已送出，請手動確認畫面（也可能是本次沒抓到網路回應，可回報給開發者看看）' };
   }
 
   function goNext() {
@@ -407,15 +545,14 @@
     ui.colRow.style.display = 'flex';
   }
 
-  function refreshCurrentStudentPanel() {
-    const cur = getCurrentStudent();
+  function renderCurrentStudentPanel(cur) {
     if (!cur) {
       ui.currentStat.innerHTML = '請開啟 SpeedGrader 並選擇一位學生';
-      return null;
+      return;
     }
     if (!cur.id) {
       ui.currentStat.innerHTML = `<span class="warn">無法從「${cur.raw}」解析出學號</span>`;
-      return cur;
+      return;
     }
     const score = state.scoreMap[cur.id];
     const pdf = state.pdfMap[cur.id];
@@ -424,6 +561,11 @@
       <div>成績比對：${score !== undefined ? `<span class="ok">${score}</span>` : '<span class="warn">找不到</span>'}</div>
       <div>PDF比對：${pdf ? `<span class="ok">${pdf.name}</span>` : '<span class="warn">找不到</span>'}</div>
     `;
+  }
+
+  function refreshCurrentStudentPanel() {
+    const cur = getCurrentStudent();
+    renderCurrentStudentPanel(cur);
     return cur;
   }
 
@@ -483,10 +625,13 @@
 
   // ---------------- 主要動作 ----------------
   async function runForCurrent(opts) {
-    const cur = refreshCurrentStudentPanel();
-    if (!cur || !cur.id) { addLog(cur && cur.raw, '', '略過', false, '無法辨識學號'); return false; }
+    let cur = getCurrentStudent();
+    if (!cur || !cur.id) cur = await waitForStudentId(2000); // 畫面可能還沒補上學號，稍等一下再判定
+    renderCurrentStudentPanel(cur);
+    if (!cur || !cur.id) { addLog((cur && cur.raw) || '-', '', '略過', false, '無法辨識學號'); return false; }
 
     let ok = true;
+    let attachedInput = null;
     try {
       if (opts.grade) {
         const score = state.scoreMap[cur.id];
@@ -504,15 +649,16 @@
           addLog(cur.id, '', '附加PDF', false, '資料夾中找不到此學號的PDF');
           ok = false;
         } else {
-          await attachFile(file);
+          attachedInput = await attachFile(file);
           addLog(cur.id, '', '附加PDF', true, file.name);
           if (state.commentText) setCommentText(state.commentText);
         }
       }
       if (opts.submit && ok) {
-        const submitted = await submitComment();
-        addLog(cur.id, '', '送出評論', submitted, submitted ? '' : '逾時，請手動確認畫面是否已送出');
-        if (submitted && state.autoAdvance) {
+        const result = await submitComment(attachedInput);
+        addLog(cur.id, '', '送出評論', result.ok, result.ok ? '' : result.error);
+        if (!result.ok) ok = false; // 送出沒有成功確認，不算這位處理完成，讓批次在這裡停下來給你檢查
+        if (result.ok && state.autoAdvance) {
           await wait(400);
           goNext();
         }
@@ -544,8 +690,13 @@
     try {
       while (processedIds.size < targetIds.size && steps < maxSteps) {
         steps++;
-        const cur = getCurrentStudent();
-        if (!cur || !cur.id) { addLog('-', '', '批次處理', false, '無法辨識目前學生，已中止'); break; }
+        // 剛換到下一位、或剛送出評論導致畫面重繪時，學號有時會晚一點才出現，
+        // 這裡耐心等到 3 秒，而不是讀一次空的就直接判定失敗、中止整個批次。
+        const cur = await waitForStudentId(3000);
+        if (!cur || !cur.id) {
+          addLog('-', '', '批次處理', false, `等了 3 秒仍無法辨識目前學生（畫面顯示：「${(cur && cur.raw) || '空白'}」），已中止`);
+          break;
+        }
 
         if (!targetIds.has(cur.id) || processedIds.has(cur.id)) {
           const moved = goNext();
@@ -598,6 +749,7 @@
     buildPanel();
     wireEvents();
     watchStudentChange();
+    scanRoster(); // 剛載入時名單通常最完整，先掃一輪把整班學號快取起來，之後即使畫面暫時沒顯示學號也能用快取補回來
     refreshCurrentStudentPanel();
 
     const saved = await loadScoreMapFromStorage();
